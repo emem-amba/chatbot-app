@@ -1,0 +1,7 @@
+streamlit
+openai
+google-generativeai
+beautifulsoup4
+requests
+pdfplumber
+streamlit-lottie
