@@ -88,7 +88,7 @@ async def scrape_cbn():
         pdf_links = []
 
         # Define key sections of the website
-        target_urls = [BASE_URL + "/out/", BASE_URL + "/IntOps/", BASE_URL + "/NewsArchive/", BASE_URL + "/FeaturedArticles/", BASE_URL + "/PaymentsSystem/", BASE_URL + "/Contacts/", BASE_URL + "/FOI/", BASE_URL + "/Documents/", BASE_URL + "/FAQS/", BASE_URL + "/Supervision/"]
+        target_urls = [BASE_URL + "/out/", BASE_URL + "/IntOps/", BASE_URL + "/NewsArchive/", BASE_URL + "/FeaturedArticles/", BASE_URL + "/PaymentsSystem/", BASE_URL + "/Contacts/", BASE_URL + "/FOI/", BASE_URL + "/Documents/", BASE_URL + "/FAQS/", BASE_URL + "/Supervision/", BASE_URL + "/AboutCBN/",]
 
         # Fetch PDF links concurrently
         tasks = [get_pdf_links(session, url) for url in target_urls]
