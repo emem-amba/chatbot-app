@@ -112,7 +112,7 @@ async def scrape_cbn():
 def embed_text(texts):
     """ Convert text to embeddings using OpenAI """
     response = openai.embeddings.create(model="text-embedding-ada-002", input=texts)
-    vectors = [data["embedding"] for data in response["data"]]
+    vectors = [data.embedding for data in response.data] 
     return np.array(vectors, dtype="float32")
 
 def create_faiss_index(pdf_texts):
