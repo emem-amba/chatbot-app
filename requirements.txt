@@ -1,9 +1,4 @@
-streamlit 
-openai 
-aiohttp 
-beautifulsoup4 
-tiktoken 
-fitz 
-pymupdf 
-faiss-cpu 
-numpy
+streamlit
+openai
+aiohttp
+beautifulsoup4

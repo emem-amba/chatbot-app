@@ -1,165 +1,80 @@
 import streamlit as st
 import openai
-import asyncio
-import aiohttp
 import os
-import fitz  # PyMuPDF for PDF parsing
-import faiss
-import numpy as np
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlparse
 
 # OpenAI API Keys (Store in .env for security)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Website URL
-BASE_URL = "https://www.cbn.gov.ng"
-PDF_FOLDER = "pdfs"
-os.makedirs(PDF_FOLDER, exist_ok=True)
-
 # Load OpenAI model
 openai.api_key = OPENAI_API_KEY
 
-# Streamlit UI with Animated Avatar
-avatars = {
-    "idle": "🤖",
-    "scraping": "🔄",
-    "chatting": "💬",
-}
+BASE_URL = "https://www.cbn.gov.ng"
 
-# Async Web Scraping
 async def fetch(session, url):
-    """ Fetch HTML content from a URL """
+    """Fetches the content of a given URL asynchronously."""
     try:
-        async with session.get(url) as response:
+        async with session.get(url, timeout=10) as response:
             return await response.text()
     except Exception as e:
         print(f"Error fetching {url}: {e}")
         return None
 
-async def get_pdf_links(session, url):
-    """ Extract PDF links from an HTML page """
+async def scrape_links(url, session, visited):
+    """Recursively scrapes all internal links and collects their text content."""
+    if url in visited or not url.startswith(BASE_URL):
+        return ""
+    
+    visited.add(url)
+    print(f"Scraping: {url}")
     html = await fetch(session, url)
     if not html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    pdf_links = []
-
-    for link in soup.find_all("a", href=True):
-        if link["href"].endswith(".pdf"):
-            full_link = BASE_URL + link["href"] if link["href"].startswith("/") else link["href"]
-            pdf_links.append(full_link)
-
-    return pdf_links
-
-async def download_pdf(session, pdf_url):
-    """ Download a PDF file asynchronously """
-    pdf_name = pdf_url.split("/")[-1]
-    pdf_path = os.path.join(PDF_FOLDER, pdf_name)
-
-    if os.path.exists(pdf_path):  # Skip already downloaded PDFs
-        return pdf_path
-
-    try:
-        async with session.get(pdf_url) as response:
-            with open(pdf_path, "wb") as f:
-                f.write(await response.read())
-        return pdf_path
-    except Exception as e:
-        print(f"Error downloading {pdf_url}: {e}")
-        return None
-
-def extract_text_from_pdf(pdf_path):
-    """ Extract text from PDF using PyMuPDF """
-    try:
-        with fitz.open(pdf_path) as doc:
-            text = "\n".join(page.get_text() for page in doc)
-        return text
-    except Exception as e:
-        print(f"Error reading {pdf_path}: {e}")
         return ""
+    
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    
+    # Find all internal links
+    links = {urljoin(BASE_URL, a['href']) for a in soup.find_all('a', href=True)}
+    
+    # Recursively scrape discovered links
+    tasks = [scrape_links(link, session, visited) for link in links if link.startswith(BASE_URL)]
+    results = await asyncio.gather(*tasks)
+    
+    return text + "\n" + "\n".join(results)
 
-async def scrape_cbn():
-    """ Scrape the CBN website and extract text from PDFs """
-    st.session_state.avatar = avatars["scraping"]
-
+async def scrape_website():
+    """Main function to scrape the entire CBN website."""
+    visited = set()
     async with aiohttp.ClientSession() as session:
-        pdf_links = []
+        return await scrape_links(BASE_URL, session, visited)
 
-        # Define key sections of the website
-        target_urls = [BASE_URL + "/out/", BASE_URL + "/IntOps/", BASE_URL + "/NewsArchive/", BASE_URL + "/FeaturedArticles/", BASE_URL + "/PaymentsSystem/", BASE_URL + "/Contacts/", BASE_URL + "/FOI/", BASE_URL + "/Documents/", BASE_URL + "/FAQS/", BASE_URL + "/Supervision/", BASE_URL + "/AboutCBN/",]
-
-        # Fetch PDF links concurrently
-        tasks = [get_pdf_links(session, url) for url in target_urls]
-        results = await asyncio.gather(*tasks)
-
-        for result in results:
-            pdf_links.extend(result)
-
-        print(f"Found {len(pdf_links)} PDFs")
-
-        # Download PDFs asynchronously
-        download_tasks = [download_pdf(session, pdf) for pdf in pdf_links]
-        pdf_paths = await asyncio.gather(*download_tasks)
-
-    # Use multi-threading for PDF processing
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = executor.map(extract_text_from_pdf, pdf_paths)
-
-    return {pdf: text for pdf, text in zip(pdf_paths, results) if text}
-
-def embed_text(texts):
-    """ Convert text to embeddings using OpenAI """
-    response = openai.embeddings.create(model="text-embedding-ada-002", input=texts)
-    vectors = [data.embedding for data in response.data] 
-    return np.array(vectors, dtype="float32")
-
-def create_faiss_index(pdf_texts):
-    """ Create a FAISS index for fast searching """
-    text_list = list(pdf_texts.values())
-    embeddings = embed_text(text_list)
-    
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-    
-    return index, list(pdf_texts.keys())
-
-def search_faiss(query, faiss_index, pdf_keys):
-    """ Search the FAISS index for the most relevant document """
-    query_embedding = embed_text([query])
-    distances, indices = faiss_index.search(query_embedding, 1)
-
-    return pdf_keys[indices[0][0]] if indices[0][0] < len(pdf_keys) else None
-
-def chat_with_openai(query, pdf_text):
-    """ Send query and relevant document text to GPT-4-Turbo """
+def ask_openai(question, context):
+    """Sends user question along with scraped data to OpenAI for response."""
     response = openai.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
-            {"role": "system", "content": "You are an AI expert on CBN regulations."},
-            {"role": "user", "content": f"Using this document:\n{pdf_text}\nAnswer: {query}"}
+            {"role": "system", "content": "You are an expert on the Central Bank of Nigeria (CBN) website."},
+            {"role": "user", "content": f"Context: {context}\n\nUser question: {question}"}
         ]
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.content.strip()
 
 # Streamlit UI
-st.title("📊 CBN Chatbot")
-st.markdown(f"## {st.session_state.get('avatar', avatars['idle'])}")
+st.title("CBN Website Chatbot")
 
-if st.button("Scrape CBN Website"):
-    pdf_texts = asyncio.run(scrape_cbn())
-    faiss_index, pdf_keys = create_faiss_index(pdf_texts)
-    st.session_state.pdf_texts = pdf_texts
-    st.session_state.faiss_index = faiss_index
-    st.session_state.pdf_keys = pdf_keys
-    st.session_state.avatar = avatars["idle"]
-    st.success("Scraping completed!")
+if "scraped_data" not in st.session_state:
+    st.session_state.scraped_data = "Scraping in progress..."
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    scraped_content = loop.run_until_complete(scrape_website())
+    st.session_state.scraped_data = scraped_content
 
-query = st.text_input("Ask a question:")
-if query and "faiss_index" in st.session_state:
-    st.session_state.avatar = avatars["chatting"]
-    relevant_pdf = search_faiss(query, st.session_state.faiss_index, st.session_state.pdf_keys)
-    response = chat_with_openai(query, st.session_state.pdf_texts[relevant_pdf])
-    st.session_state.avatar = avatars["idle"]
-    st.write(response)
+question = st.text_input("Ask a question about CBN:")
+if question:
+    with st.spinner("Thinking..."):
+        answer = ask_openai(question, st.session_state.scraped_data[:5000])  # Limiting context size
+        st.write(answer)
