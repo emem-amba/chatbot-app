@@ -1,7 +1,9 @@
-streamlit
-openai
-google-generativeai
-beautifulsoup4
-requests
-pdfplumber
-streamlit-lottie
+streamlit 
+openai 
+aiohttp 
+beautifulsoup4 
+tiktoken 
+fitz 
+pymupdf 
+faiss-cpu 
+numpy

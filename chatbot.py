@@ -1,88 +1,165 @@
-import os
-import requests
-import pdfplumber
-import openai
-import google.generativeai as genai
 import streamlit as st
+import openai
+import asyncio
+import aiohttp
+import os
+import fitz  # PyMuPDF for PDF parsing
+import faiss
+import numpy as np
 from bs4 import BeautifulSoup
-#from dotenv import load_dotenv
-from streamlit_lottie import st_lottie
+from concurrent.futures import ThreadPoolExecutor
 
-# Load API keys
-#load_dotenv()
+# OpenAI API Keys (Store in .env for security)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
+# Website URL
+BASE_URL = "https://www.cbn.gov.ng"
+PDF_FOLDER = "pdfs"
+os.makedirs(PDF_FOLDER, exist_ok=True)
 
-def fetch_lottie_animation(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
+# Load OpenAI model
+openai.api_key = OPENAI_API_KEY
 
-# Function to scrape website
+# Streamlit UI with Animated Avatar
+avatars = {
+    "idle": "🤖",
+    "scraping": "🔄",
+    "chatting": "💬",
+}
 
-def scrape_website(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.text, 'html.parser')
-        return soup.get_text()
-    return "Error: Unable to fetch data"
+# Async Web Scraping
+async def fetch(session, url):
+    """ Fetch HTML content from a URL """
+    try:
+        async with session.get(url) as response:
+            return await response.text()
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
 
-# Function to extract text from PDFs
-def extract_text_from_pdf(url):
-    response = requests.get(url, stream=True)
-    if response.status_code == 200:
-        with open("temp.pdf", "wb") as pdf_file:
-            pdf_file.write(response.content)
-        text = ""
-        with pdfplumber.open("temp.pdf") as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() + "\n"
-        os.remove("temp.pdf")
+async def get_pdf_links(session, url):
+    """ Extract PDF links from an HTML page """
+    html = await fetch(session, url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    pdf_links = []
+
+    for link in soup.find_all("a", href=True):
+        if link["href"].endswith(".pdf"):
+            full_link = BASE_URL + link["href"] if link["href"].startswith("/") else link["href"]
+            pdf_links.append(full_link)
+
+    return pdf_links
+
+async def download_pdf(session, pdf_url):
+    """ Download a PDF file asynchronously """
+    pdf_name = pdf_url.split("/")[-1]
+    pdf_path = os.path.join(PDF_FOLDER, pdf_name)
+
+    if os.path.exists(pdf_path):  # Skip already downloaded PDFs
+        return pdf_path
+
+    try:
+        async with session.get(pdf_url) as response:
+            with open(pdf_path, "wb") as f:
+                f.write(await response.read())
+        return pdf_path
+    except Exception as e:
+        print(f"Error downloading {pdf_url}: {e}")
+        return None
+
+def extract_text_from_pdf(pdf_path):
+    """ Extract text from PDF using PyMuPDF """
+    try:
+        with fitz.open(pdf_path) as doc:
+            text = "\n".join(page.get_text() for page in doc)
         return text
-    return "Error: Unable to fetch PDF"
+    except Exception as e:
+        print(f"Error reading {pdf_path}: {e}")
+        return ""
 
-# Function to get AI response
-def get_ai_response(prompt, model="openai"):
-    if model == "openai":
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+async def scrape_cbn():
+    """ Scrape the CBN website and extract text from PDFs """
+    st.session_state.avatar = avatars["scraping"]
 
-        response = client.chat.completions.create(
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    elif model == "gemini":
-        model = genai.GenerativeModel("gemini-pro")
-        response = model.generate_content(prompt)
-        return response.text
-    return "Invalid AI model selected."
+    async with aiohttp.ClientSession() as session:
+        pdf_links = []
+
+        # Define key sections of the website
+        target_urls = [BASE_URL + "/out/", BASE_URL + "/IntOps/", BASE_URL + "/NewsArchive/", BASE_URL + "/FeaturedArticles/", BASE_URL + "/PaymentsSystem/", BASE_URL + "/Contacts/", BASE_URL + "/FOI/", BASE_URL + "/Documents/", BASE_URL + "/FAQS/", BASE_URL + "/Supervision/"]
+
+        # Fetch PDF links concurrently
+        tasks = [get_pdf_links(session, url) for url in target_urls]
+        results = await asyncio.gather(*tasks)
+
+        for result in results:
+            pdf_links.extend(result)
+
+        print(f"Found {len(pdf_links)} PDFs")
+
+        # Download PDFs asynchronously
+        download_tasks = [download_pdf(session, pdf) for pdf in pdf_links]
+        pdf_paths = await asyncio.gather(*download_tasks)
+
+    # Use multi-threading for PDF processing
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = executor.map(extract_text_from_pdf, pdf_paths)
+
+    return {pdf: text for pdf, text in zip(pdf_paths, results) if text}
+
+def embed_text(texts):
+    """ Convert text to embeddings using OpenAI """
+    response = openai.embeddings.create(model="text-embedding-ada-002", input=texts)
+    vectors = [data["embedding"] for data in response["data"]]
+    return np.array(vectors, dtype="float32")
+
+def create_faiss_index(pdf_texts):
+    """ Create a FAISS index for fast searching """
+    text_list = list(pdf_texts.values())
+    embeddings = embed_text(text_list)
+    
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    
+    return index, list(pdf_texts.keys())
+
+def search_faiss(query, faiss_index, pdf_keys):
+    """ Search the FAISS index for the most relevant document """
+    query_embedding = embed_text([query])
+    distances, indices = faiss_index.search(query_embedding, 1)
+
+    return pdf_keys[indices[0][0]] if indices[0][0] < len(pdf_keys) else None
+
+def chat_with_openai(query, pdf_text):
+    """ Send query and relevant document text to GPT-4-Turbo """
+    response = openai.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "system", "content": "You are an AI expert on CBN regulations."},
+            {"role": "user", "content": f"Using this document:\n{pdf_text}\nAnswer: {query}"}
+        ]
+    )
+    return response.choices[0].message.content
 
 # Streamlit UI
-st.set_page_config(page_title="Web Scraper Chatbot", layout="wide")
+st.title("📊 CBN Chatbot")
+st.markdown(f"## {st.session_state.get('avatar', avatars['idle'])}")
 
-st.title("🌐 AI Chatbot with Web Scraping and PDF Parsing")
+if st.button("Scrape CBN Website"):
+    pdf_texts = asyncio.run(scrape_cbn())
+    faiss_index, pdf_keys = create_faiss_index(pdf_texts)
+    st.session_state.pdf_texts = pdf_texts
+    st.session_state.faiss_index = faiss_index
+    st.session_state.pdf_keys = pdf_keys
+    st.session_state.avatar = avatars["idle"]
+    st.success("Scraping completed!")
 
-# Load and display animated avatar
-lottie_url = "https://assets4.lottiefiles.com/packages/lf20_jcikwtux.json"
-animation = fetch_lottie_animation(lottie_url)
-if animation:
-    st_lottie(animation, height=200)
-
-# User input
-url = st.text_input("Enter website URL to scrape:")
-use_ai_model = st.selectbox("Select AI Model:", ["openai", "gemini"])
-user_question = st.text_area("Ask a question:")
-
-if st.button("Get Answer"):
-    if url.endswith(".pdf"):
-        text = extract_text_from_pdf(url)
-    else:
-        text = scrape_website(url)
-    
-    full_prompt = f"Extract relevant details from this text and answer the user's query: {text}\nUser Question: {user_question}"
-    response = get_ai_response(full_prompt, model=use_ai_model)
-    st.write("### Response:")
-    st.success(response)
+query = st.text_input("Ask a question:")
+if query and "faiss_index" in st.session_state:
+    st.session_state.avatar = avatars["chatting"]
+    relevant_pdf = search_faiss(query, st.session_state.faiss_index, st.session_state.pdf_keys)
+    response = chat_with_openai(query, st.session_state.pdf_texts[relevant_pdf])
+    st.session_state.avatar = avatars["idle"]
+    st.write(response)
